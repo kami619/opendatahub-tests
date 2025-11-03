@@ -38,7 +38,7 @@ The current workbench spawning test provides minimal value, only confirming that
 7.  The new test must use `@pytest.mark.sanity` and `@pytest.mark.slow` markers (not smoke, due to extended runtime)
 8.  The existing `test_spawning.py` tests should remain unchanged and continue to pass
 9.  Create `tests/workbenches/README.md` documenting the test structure, ownership model, and how to add new custom image tests
-10. Coordinate with workbench image team to identify the location of the `sdg_hub`-enabled workbench image (blocker for implementation)
+10. Coordinate with workbench image team to identify the location of the `sdg_hub`-enabled workbench image (blocker for implementation) or fall back on using the existing minimal image defined in the notebook fixture for the initial validation.
 
 ---
 
