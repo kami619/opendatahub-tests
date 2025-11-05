@@ -56,19 +56,33 @@ def default_notebook(
     # Optional Auth annotations
     auth_annotations = request.param.get("auth_annotations", {})
 
+    # Optional custom image parameter (for custom workbench image testing)
+    custom_image = request.param.get("custom_image", None)
+
     # Set the correct username
     username = get_username(dyn_client=admin_client)
     assert username, "Failed to determine username from the cluster"
 
-    # Check internal image registry availability
-    internal_image_registry = check_internal_image_registry_available(admin_client=admin_client)
+    # Determine which image to use
+    if custom_image:
+        # Custom image provided - use it directly (must include full registry path with tag)
+        if not custom_image or ":" not in custom_image:
+            raise ValueError(
+                f"custom_image must be a full image URL with tag (e.g., 'quay.io/org/image:tag'), got: '{custom_image}'"
+            )
+        minimal_image_path = custom_image
+        LOGGER.info(f"Using custom workbench image: {custom_image}")
+    else:
+        # No custom image - use default minimal image with registry resolution
+        # Check internal image registry availability
+        internal_image_registry = check_internal_image_registry_available(admin_client=admin_client)
 
-    # Set the image path based on internal image registry status
-    minimal_image_path = (
-        f"{INTERNAL_IMAGE_REGISTRY_PATH}/{py_config['applications_namespace']}/{minimal_image}"
-        if internal_image_registry
-        else ":" + minimal_image.rsplit(":", maxsplit=1)[1]
-    )
+        # Set the image path based on internal image registry status
+        minimal_image_path = (
+            f"{INTERNAL_IMAGE_REGISTRY_PATH}/{py_config['applications_namespace']}/{minimal_image}"
+            if internal_image_registry
+            else ":" + minimal_image.rsplit(":", maxsplit=1)[1]
+        )
 
     probe_config = {
         "failureThreshold": 3,
