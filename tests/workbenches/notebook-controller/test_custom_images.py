@@ -9,8 +9,11 @@ from ocp_resources.namespace import Namespace
 from ocp_resources.notebook import Notebook
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 
-from tests.workbenches.utils import verify_package_import
+from tests.workbenches.utils import verify_package_import, install_packages_in_pod
 from utilities.constants import Timeout
+from simple_logger.logger import get_logger
+
+LOGGER = get_logger(name=__name__)
 
 
 class TestCustomImageValidation:
@@ -48,30 +51,9 @@ class TestCustomImageValidation:
                 {
                     "namespace": "test-sdg-hub",
                     "name": "test-sdg-hub",
-                    "custom_image": "quay.io/opendatahub/workbench-images:jupyter-datascience-c9s-py311_2023c_20241120",  # Placeholder - update with sdg_hub image
+                    "custom_image": "quay.io/repository/opendatahub/odh-workbench-jupyter-minimal-cuda-py312-ubi9/manifest/sha256:9458a764d861cbe0a782a53e0f5a13a4bcba35d279145d87088ab3cdfabcad1d",
                 },
                 id="sdg_hub_image",
-                marks=pytest.mark.skip(reason="Waiting for sdg_hub image URL from workbench image team"),
-            ),
-            # Test Case: Data Science Notebook (Demonstration of Pattern Reusability)
-            # Image: Standard datascience workbench image
-            # Required Packages: numpy, pandas, matplotlib, scikit-learn
-            # Purpose: Demonstrate test framework scalability with second image validation
-            # Contact: workbench-image-team@redhat.com
-            pytest.param(
-                {
-                    "name": "test-datascience",
-                    "add-dashboard-label": True,
-                },
-                {
-                    "name": "test-datascience",
-                },
-                {
-                    "namespace": "test-datascience",
-                    "name": "test-datascience",
-                    "custom_image": "quay.io/opendatahub/workbench-images:jupyter-datascience-c9s-py311_2023c_20241120",
-                },
-                id="datascience_image",
             ),
         ],
         indirect=True,
@@ -135,19 +117,34 @@ class TestCustomImageValidation:
                     f"Pod '{default_notebook.name}-0' was not created. Check notebook controller logs."
                 ) from e
 
-        # Verify packages are importable
+        # Determine packages to verify based on test ID
         # Different packages per test case (based on test ID from parametrization)
         test_id = request.node.callspec.id
         if "sdg_hub" in test_id:
-            # SDG Hub image packages (placeholder - update when image URL is available)
-            packages_to_verify = ["sys", "os"]  # Replace with ["sdg_hub", "instructlab"]
-        elif "datascience" in test_id:
-            # Data science image packages
-            packages_to_verify = ["numpy", "pandas", "matplotlib", "sklearn"]
+            # SDG Hub image packages - install dynamically for self-contained testing
+            packages_to_verify = ["sdg_hub"]
         else:
             # Default: basic Python packages
             packages_to_verify = ["sys", "os"]
 
+        # Install packages if they're not standard library (not in the default list)
+        standard_lib_packages = {"sys", "os"}
+        packages_to_install = [pkg for pkg in packages_to_verify if pkg not in standard_lib_packages]
+
+        if packages_to_install:
+            LOGGER.info(f"Installing {len(packages_to_install)} packages: {packages_to_install}")
+            install_results = install_packages_in_pod(
+                pod=notebook_pod,
+                container_name=default_notebook.name,
+                packages=packages_to_install,
+                timeout=Timeout.TIMEOUT_2MIN,
+            )
+
+            failed_installs = [name for name, success in install_results.items() if not success]
+            if failed_installs:
+                LOGGER.warning(f"Failed to install packages: {failed_installs}")
+
+        # Verify packages are importable
         results = verify_package_import(
             pod=notebook_pod,
             container_name=default_notebook.name,

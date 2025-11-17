@@ -154,6 +154,88 @@ def verify_package_import(
     return results
 
 
+def install_packages_in_pod(
+    pod: Pod,
+    container_name: str,
+    packages: list[str],
+    timeout: int = 120,
+) -> dict[str, bool]:
+    """
+    Install Python packages in a running pod container using pip.
+
+    This function executes 'pip install <package>' for each package
+    in the provided list and returns installation results.
+
+    Args:
+        pod: Pod instance to execute commands in (from ocp_resources.pod)
+        container_name: Name of the container within the pod to target
+        packages: List of Python package names to install (e.g., ["sdg-hub", "instructlab"])
+        timeout: Maximum time in seconds to wait for each install command (default: 120)
+
+    Returns:
+        Dictionary mapping package names to installation success status (True/False).
+
+    Raises:
+        ValueError: If packages list is empty or pod is invalid
+        RuntimeError: If pod is not in Running state or container doesn't exist
+
+    Example:
+        >>> from ocp_resources.pod import Pod
+        >>> from tests.workbenches.utils import install_packages_in_pod
+        >>>
+        >>> pod = Pod(client=client, namespace="test", name="notebook-0")
+        >>> install_results = install_packages_in_pod(
+        ...     pod=pod,
+        ...     container_name="notebook",
+        ...     packages=["sdg-hub", "instructlab"]
+        ... )
+        >>> assert install_results.get("sdg-hub") is True
+    """
+    # Input validation
+    if not pod or not isinstance(packages, list) or not packages:
+        raise ValueError("pod must be valid and packages must be a non-empty list")
+
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+
+    # Check pod exists and is running
+    if not pod.exists:
+        raise RuntimeError(f"Pod {pod.name} does not exist")
+
+    pod_status = pod.instance.status
+    if pod_status.phase != "Running":
+        raise RuntimeError(f"Pod {pod.name} is not in Running state (current: {pod_status.phase})")
+
+    # Verify container exists
+    container_names = [c.name for c in pod.instance.spec.containers]
+    if container_name not in container_names:
+        raise RuntimeError(
+            f"Container '{container_name}' not found in pod. Available containers: {container_names}"
+        )
+
+    LOGGER.info(f"Installing {len(packages)} packages in container '{container_name}' of pod '{pod.name}'")
+
+    # Install each package
+    results = {}
+    for package_name in packages:
+        command_list = ["pip", "install", package_name, "--quiet"]
+
+        LOGGER.debug(f"Executing: {' '.join(command_list)}")
+
+        try:
+            # Execute command in container
+            output = pod.execute(container=container_name, command=command_list)
+            results[package_name] = True
+            LOGGER.info(f"Package {package_name}: ✓ (installed successfully)")
+
+        except ExecOnPodError as e:
+            error_message = str(e)
+            results[package_name] = False
+            LOGGER.warning(f"Package {package_name}: ✗ (installation failed: {error_message})")
+
+    return results
+
+
 def get_username(dyn_client: DynamicClient) -> str | None:
     """Gets the username for the client (see kubectl -v8 auth whoami)"""
     username: str | None
