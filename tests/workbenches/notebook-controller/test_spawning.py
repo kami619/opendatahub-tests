@@ -25,10 +25,7 @@ STANDARD_PACKAGES = [
 
 # Data science packages - these may not be available in minimal images
 DATA_SCIENCE_PACKAGES = [
-    "numpy",
-    "pandas", 
-    "matplotlib",
-    "sklearn"
+    "sdg-hub"
 ]
 
 # Packages that should always be available in any Python environment

@@ -39,7 +39,7 @@ def users_persistent_volume_claim(
 @pytest.fixture(scope="function")
 def minimal_image() -> Generator[str, None, None]:
     """Provides a full image name of a minimal workbench image"""
-    image_name = "jupyter-minimal-notebook" if py_config.get("distribution") == "upstream" else "s2i-minimal-notebook"
+    image_name = "jupyter-minimal-notebook" if py_config.get("distribution") == "upstream" else "minimal-gpu"
     yield f"{image_name}:{'2025.2'}"
 
 
