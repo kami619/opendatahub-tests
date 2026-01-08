@@ -5,9 +5,23 @@
 **Status**: Draft
 **Input**: Enable Konflux IT pipelines to drive integration tests against Red Hat OpenShift AI deployments
 
+## Clarifications
+
+### Session 2026-01-08
+
+- Q: What is the cluster provisioning model for test execution? → A: Dedicated CI cluster - A single persistent cluster reserved for CI testing
+- Q: What observability approach for pipeline monitoring? → A: Structured logging with correlation IDs; rely on Konflux native log aggregation
+- Q: How to handle GPU unavailability during test execution? → A: Fail fast - If GPU unavailable, fail the test immediately with clear error
+- Q: Which distribution is the primary target for initial implementation? → A: ODH first - Primary focus on upstream; RHOAI as secondary validation
+- Q: How to handle transient infrastructure failures? → A: Automatic retry (limited) - Retry pipeline tasks up to 2 times for transient failures only
+
 ## Overview
 
 This feature integrates the opendatahub-tests repository with Konflux (Red Hat's Tekton-based CI/CD platform) to enable automated integration testing against RHOAI deployments. The goal is to move from static checks (tox) to full integration test execution in CI pipelines.
+
+**Cluster Model**: Tests execute against a dedicated CI cluster - a single persistent OpenShift cluster reserved exclusively for CI testing. This cluster is pre-provisioned and maintained separately from development/staging environments.
+
+**Distribution Priority**: Primary focus is on ODH (upstream Open Data Hub) with RHOAI (downstream Red Hat OpenShift AI) as secondary validation. Default pipeline configuration targets ODH; RHOAI validation runs as a follow-up or configurable option.
 
 ## User Scenarios & Testing
 
@@ -113,6 +127,10 @@ As a test engineer diagnosing failures, I want must-gather artifacts collected a
   - Resource quota per namespace; tests marked `gpu` run sequentially
 - How does system handle flaky tests?
   - Optional retry mechanism (max 2 retries) for marked flaky tests
+- What happens when GPU resources are unavailable?
+  - Fail fast with clear error message indicating GPU unavailability; do not queue or wait
+- How does system handle transient infrastructure failures?
+  - Automatic retry with maximum 2 attempts for transient failures (network timeouts, temporary API unavailability); permanent failures fail immediately
 
 ## Requirements
 
@@ -124,6 +142,7 @@ As a test engineer diagnosing failures, I want must-gather artifacts collected a
 - **FR-002**: System MUST build test container image from existing Dockerfile on pipeline trigger
 - **FR-003**: System MUST support both PR-triggered and merge-triggered pipeline runs
 - **FR-004**: System MUST support manual pipeline triggers with configurable parameters
+- **FR-004a**: System MUST target a dedicated CI cluster (single persistent cluster reserved for CI testing)
 
 #### Test Execution
 
@@ -131,7 +150,7 @@ As a test engineer diagnosing failures, I want must-gather artifacts collected a
 - **FR-006**: System MUST support pytest-xdist parallel execution with configurable worker count
 - **FR-007**: System MUST isolate each parallel worker in a unique Kubernetes namespace
 - **FR-008**: System MUST enforce test timeout at individual test and pipeline level
-- **FR-009**: System MUST support both upstream (ODH) and downstream (RHOAI) distributions
+- **FR-009**: System MUST support both upstream (ODH) and downstream (RHOAI) distributions, with ODH as primary target and RHOAI as secondary validation
 
 #### Authentication & Authorization
 
@@ -151,6 +170,17 @@ As a test engineer diagnosing failures, I want must-gather artifacts collected a
 - **FR-017**: System MUST externalize configuration via ConfigMap/Secret
 - **FR-018**: System MUST support environment-specific configuration profiles (dev, staging, prod)
 - **FR-019**: System MUST validate configuration schema at pipeline start
+
+#### Observability
+
+- **FR-020**: System MUST emit structured logs with correlation IDs linking pipeline run to test execution
+- **FR-021**: System MUST rely on Konflux native log aggregation (no external logging infrastructure required)
+- **FR-022**: System MUST include pipeline run ID, test markers, and worker ID in all log entries
+
+#### Resilience
+
+- **FR-023**: System MUST automatically retry pipeline tasks up to 2 times for transient infrastructure failures (network timeouts, temporary API unavailability)
+- **FR-024**: System MUST distinguish between transient and permanent failures; permanent failures MUST NOT be retried
 
 ### Key Entities
 
