@@ -8,6 +8,11 @@
 
 ## Clarifications
 
+### Session 2026-01-13
+
+- Q: Does Konflux EaaS support GPU instance types? → A: **NO** - EaaS only supports: `m5.large`, `m5.xlarge`, `m5.2xlarge`, `m6g.large`, `m6g.xlarge`, `m6g.2xlarge`. No GPU instances (g4dn, g5, p3, p4) are available.
+- Q: How will GPU-dependent tests run? → A: Hybrid architecture - GPU tests run on dedicated persistent cluster with GPU nodes; non-GPU tests run on ephemeral EaaS clusters via ITS
+
 ### Session 2026-01-12
 
 - Q: What is the integration model? → A: IntegrationTestScenario (ITS) - Tests run as part of existing Konflux component build pipelines, not as a standalone pipeline
@@ -29,6 +34,125 @@ This feature enables opendatahub-tests to run as an **IntegrationTestScenario (I
 **Cluster Model**: Ephemeral HyperShift clusters provisioned on-demand via Konflux EaaS. Clusters are created at test start and destroyed after completion (10-20 min provisioning time).
 
 **SNAPSHOT Parameter**: Konflux automatically provides a SNAPSHOT JSON parameter containing references to all built component images in the application. The test pipeline uses this to deploy and validate the correct image versions.
+
+## GPU Limitation & Hybrid Architecture
+
+### Konflux EaaS GPU Limitation
+
+**Critical Constraint**: Konflux EaaS does **NOT** support GPU instance types. The `eaas-create-ephemeral-cluster-hypershift-aws` StepAction only supports the following instance types:
+
+| Supported Instance Types | vCPU | Memory | GPU |
+|--------------------------|------|--------|-----|
+| `m5.large` | 2 | 8 GB | ❌ None |
+| `m5.xlarge` | 4 | 16 GB | ❌ None |
+| `m5.2xlarge` | 8 | 32 GB | ❌ None |
+| `m6g.large` (default) | 2 | 8 GB | ❌ None |
+| `m6g.xlarge` | 4 | 16 GB | ❌ None |
+| `m6g.2xlarge` | 8 | 32 GB | ❌ None |
+
+**Not Supported**: `g4dn.*`, `g5.*`, `p3.*`, `p4d.*`, or any other GPU-enabled instance types.
+
+**Source**: [Konflux EaaS StepAction Documentation](https://github.com/konflux-ci/build-definitions/tree/main/stepactions/eaas-create-ephemeral-cluster-hypershift-aws)
+
+### Impact on ODH/RHOAI Testing
+
+Many ODH/RHOAI workloads require GPU resources:
+
+| Test Category | pytest Marker | GPU Required | ITS Compatible |
+|---------------|---------------|--------------|----------------|
+| Model Serving (CPU) | `smoke`, `sanity` | No | ✅ Yes |
+| Dashboard/UI | `smoke` | No | ✅ Yes |
+| Model Registry | `model_registry` | No | ✅ Yes |
+| KServe GPU inference | `model_server_gpu` | **Yes** | ❌ No |
+| vLLM/TGI runtimes | `llmd_gpu` | **Yes** | ❌ No |
+| LLM inference | `gpu` | **Yes** | ❌ No |
+| Training workloads | `gpu` | **Yes** | ❌ No |
+
+### Hybrid Architecture
+
+To address this limitation, a **hybrid testing architecture** is required:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HYBRID TEST ARCHITECTURE                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐  │
+│  │   PATH A: NON-GPU TESTS         │  │   PATH B: GPU TESTS             │  │
+│  │   (Konflux ITS)                 │  │   (Dedicated Cluster)           │  │
+│  ├─────────────────────────────────┤  ├─────────────────────────────────┤  │
+│  │                                 │  │                                 │  │
+│  │  Trigger: Component build      │  │  Trigger: Scheduled / Manual    │  │
+│  │  Cluster: Ephemeral EaaS       │  │  Cluster: Persistent with GPU   │  │
+│  │  Nodes: m5/m6g instances       │  │  Nodes: g4dn/g5 instances       │  │
+│  │  Markers: smoke, sanity,       │  │  Markers: gpu, model_server_gpu │  │
+│  │           tier1 (non-gpu)      │  │           llmd_gpu              │  │
+│  │  Duration: <45 min             │  │  Duration: Variable             │  │
+│  │  Lifecycle: Created/destroyed  │  │  Lifecycle: Always running      │  │
+│  │                                 │  │                                 │  │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘  │
+│                                                                             │
+│  Test Selection Logic:                                                      │
+│  ├── ITS Pipeline: pytest -m "smoke and not gpu"                           │
+│  └── GPU Pipeline: pytest -m "gpu or model_server_gpu or llmd_gpu"         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hybrid Architecture Components
+
+#### Path A: Non-GPU Tests (Konflux ITS)
+
+- **Execution Environment**: Ephemeral HyperShift clusters via Konflux EaaS
+- **Trigger**: Automatic on component build completion
+- **Test Selection**: `-m "smoke and not gpu"` or `-m "sanity and not gpu"`
+- **Pipeline**: `.tekton/integration-test-pipeline.yaml`
+- **ITS CR**: `konflux/integration-test-scenario-smoke.yaml`
+
+#### Path B: GPU Tests (Dedicated Cluster)
+
+- **Execution Environment**: Persistent OpenShift cluster with GPU node pool
+- **GPU Nodes**: AWS g4dn.xlarge (NVIDIA T4) or g5.xlarge (NVIDIA A10G)
+- **Trigger**: Scheduled (nightly) or manual trigger after ITS passes
+- **Test Selection**: `-m "gpu or model_server_gpu or llmd_gpu"`
+- **Pipeline**: Separate pipeline (not ITS) or external CI (GitHub Actions)
+- **Cluster Management**: Pre-provisioned, maintained by infrastructure team
+
+### Test Marker Strategy
+
+To support the hybrid architecture, tests MUST be properly marked:
+
+```python
+# Non-GPU test - runs on ITS ephemeral cluster
+@pytest.mark.smoke
+def test_dashboard_loads():
+    ...
+
+# GPU test - runs on dedicated GPU cluster only
+@pytest.mark.gpu
+@pytest.mark.model_server_gpu
+def test_vllm_inference():
+    ...
+
+# Mixed test - explicitly exclude from ITS
+@pytest.mark.tier1
+@pytest.mark.gpu  # This marker excludes it from ITS
+def test_kserve_gpu_model():
+    ...
+```
+
+### Dedicated GPU Cluster Requirements
+
+| Requirement | Specification |
+|-------------|---------------|
+| **Cloud Provider** | AWS (preferred) or GCP |
+| **GPU Instance Type** | g4dn.xlarge (1x NVIDIA T4, 16GB) minimum |
+| **GPU Node Pool Size** | 2-4 nodes for parallel test execution |
+| **OpenShift Version** | 4.14+ with Node Feature Discovery (NFD) |
+| **GPU Operator** | NVIDIA GPU Operator installed |
+| **Persistence** | Always running (not ephemeral) |
+| **Access** | ServiceAccount with cluster-admin for test namespace |
+| **Cost Consideration** | ~$0.526/hour per g4dn.xlarge node |
 
 ## User Scenarios & Testing
 
@@ -159,7 +283,9 @@ As a QE engineer, I want different ITS configurations for different contexts so 
 - What happens when the test container image is not available?
   - Pipeline fails at image pull stage with clear error
 - How does system handle tests that require GPU?
-  - GPU tests are excluded from ITS (ephemeral clusters may not have GPU); run separately on dedicated cluster
+  - GPU tests are **explicitly excluded** from ITS using marker filtering (`-m "smoke and not gpu"`)
+  - GPU tests run on a dedicated persistent cluster with GPU nodes (Path B of hybrid architecture)
+  - See [GPU Limitation & Hybrid Architecture](#gpu-limitation--hybrid-architecture) section for details
 
 ## Requirements
 
@@ -192,18 +318,27 @@ As a QE engineer, I want different ITS configurations for different contexts so 
 - **FR-014**: System MUST use the opendatahub-tests container image for test execution
 - **FR-015**: System MUST generate JUnit XML test reports
 - **FR-016**: System MUST enforce test timeout (configurable, default 30 min for smoke)
+- **FR-017**: System MUST exclude GPU tests from ITS pipeline using marker filter (`and not gpu`)
+
+#### Hybrid Architecture (GPU Support)
+
+- **FR-018**: System MUST support a dedicated persistent cluster for GPU test execution
+- **FR-019**: GPU tests MUST be identifiable via pytest markers (`gpu`, `model_server_gpu`, `llmd_gpu`)
+- **FR-020**: GPU cluster MUST have NVIDIA GPU Operator and Node Feature Discovery installed
+- **FR-021**: GPU test pipeline MUST accept same SNAPSHOT parameter for component image validation
+- **FR-022**: GPU test results MUST be reportable back to Konflux (via external reporting mechanism)
 
 #### Artifact Management
 
-- **FR-017**: System MUST collect must-gather on test failure
-- **FR-018**: System MUST upload artifacts before cluster destruction
-- **FR-019**: System MUST compress must-gather archives
+- **FR-023**: System MUST collect must-gather on test failure
+- **FR-024**: System MUST upload artifacts before cluster destruction
+- **FR-025**: System MUST compress must-gather archives
 
 #### Result Reporting
 
-- **FR-020**: System MUST report pass/fail status to Konflux Integration Service
-- **FR-021**: System MUST provide test summary in pipeline results
-- **FR-022**: System MUST include artifact links in results
+- **FR-026**: System MUST report pass/fail status to Konflux Integration Service
+- **FR-027**: System MUST provide test summary in pipeline results
+- **FR-028**: System MUST include artifact links in results
 
 ### Key Entities
 
@@ -212,6 +347,7 @@ As a QE engineer, I want different ITS configurations for different contexts so 
 - **Pipeline**: Tekton Pipeline defining test execution workflow
 - **ClusterTemplateInstance**: EaaS resource for ephemeral cluster provisioning
 - **TestConfiguration**: Parameters passed to pipeline (markers, timeout, distribution)
+- **DedicatedGPUCluster**: Persistent OpenShift cluster with GPU nodes for GPU test execution (Path B)
 
 ## Success Criteria
 
@@ -235,11 +371,12 @@ As a QE engineer, I want different ITS configurations for different contexts so 
 ## Out of Scope (Phase 1)
 
 - Parallel test execution (pytest-xdist) - ephemeral clusters are single-use
-- GPU-based tests - ephemeral HyperShift clusters may not have GPU nodes
+- **GPU-based tests on ITS** - Konflux EaaS does not support GPU instance types; GPU tests will run on dedicated cluster (see Hybrid Architecture)
 - Performance/load testing - ITS not suitable for long-running tests
 - Multi-cluster test orchestration
 - Integration with external test management (Polarion, ReportPortal)
 - RHOAI installation (ODH first; RHOAI as Phase 2)
+- Automated provisioning of dedicated GPU cluster (assumed pre-existing infrastructure)
 
 ## References
 

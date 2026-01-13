@@ -1,11 +1,13 @@
 # Implementation Plan: Konflux Integration Test Scenario
 
-**Branch**: `konflux-integration` | **Date**: 2026-01-12 | **Spec**: [spec.md](./spec.md)
+**Branch**: `konflux-integration` | **Date**: 2026-01-13 | **Spec**: [spec.md](./spec.md)
 **Input**: Feature specification from `/specs/konflux-integration/spec.md`
 
 ## Summary
 
 Enable opendatahub-tests to run as an **IntegrationTestScenario (ITS)** in existing Konflux component build pipelines. When a component is built, the Konflux Integration Service triggers the ITS pipeline which provisions an ephemeral HyperShift cluster, installs ODH with SNAPSHOT component images, runs smoke tests, and reports results back to Konflux.
+
+**Important**: Due to Konflux EaaS GPU limitations, a **hybrid architecture** is required. Non-GPU tests run on ephemeral clusters via ITS (Path A), while GPU tests run on a dedicated persistent cluster (Path B).
 
 ## Technical Context
 
@@ -16,8 +18,8 @@ Enable opendatahub-tests to run as an **IntegrationTestScenario (ITS)** in exist
 **Target Platform**: Konflux-managed ephemeral HyperShift clusters on AWS
 **Project Type**: CI/CD pipeline integration (IntegrationTestScenario)
 **Performance Goals**: Total ITS execution <45 min (including ~15 min cluster provisioning)
-**Constraints**: SNAPSHOT parameter required, ephemeral cluster lifecycle, no GPU support
-**Scale/Scope**: Smoke tests only (~50 tests), single cluster per run
+**Constraints**: SNAPSHOT parameter required, ephemeral cluster lifecycle, **no GPU support on EaaS** (see Hybrid Architecture)
+**Scale/Scope**: Non-GPU smoke tests on ITS (~50 tests), GPU tests on dedicated cluster
 
 ## Constitution Check
 
@@ -48,16 +50,24 @@ specs/konflux-integration/
 
 ```text
 .tekton/                                    # NEW: Tekton pipeline for ITS
-└── integration-test-pipeline.yaml          # Main integration test pipeline
+└── integration-test-pipeline.yaml          # Main integration test pipeline (Path A)
+
+.github/workflows/                          # NEW: GitHub Actions for GPU tests
+└── gpu-tests.yaml                          # GPU test workflow (Path B)
 
 konflux/                                    # NEW: Konflux resources
-├── integration-test-scenario-smoke.yaml    # ITS CR for smoke tests
+├── integration-test-scenario-smoke.yaml    # ITS CR for smoke tests (non-GPU)
 └── integration-test-scenario-sanity.yaml   # ITS CR for sanity tests (Phase 2)
 
 scripts/                                    # NEW: Helper scripts for pipeline
 ├── install-odh.sh                          # ODH operator installation
 ├── parse-snapshot.py                       # Extract component images from SNAPSHOT
 └── apply-snapshot-images.py                # Apply SNAPSHOT images to DSC
+
+infra/                                      # NEW: Infrastructure definitions (Path B)
+└── gpu-cluster/
+    ├── README.md                           # GPU cluster setup instructions
+    └── node-pool-config.yaml               # GPU node pool configuration
 
 tests/
 └── conftest.py                             # MODIFY: Add SNAPSHOT-aware fixtures (optional)
@@ -160,6 +170,153 @@ spec:
       value: smoke
 ```
 
+## GPU Limitation & Hybrid Architecture
+
+### Konflux EaaS GPU Limitation
+
+**Critical Finding**: The Konflux EaaS `eaas-create-ephemeral-cluster-hypershift-aws` StepAction does **NOT** support GPU instance types.
+
+**Supported Instance Types** (from [EaaS StepAction documentation](https://github.com/konflux-ci/build-definitions/tree/main/stepactions/eaas-create-ephemeral-cluster-hypershift-aws)):
+
+```
+Supported values: m5.large, m5.xlarge, m5.2xlarge, m6g.large, m6g.xlarge, m6g.2xlarge
+```
+
+**Not Available**: `g4dn.*` (NVIDIA T4), `g5.*` (NVIDIA A10G), `p3.*`, `p4d.*` or any GPU-enabled instances.
+
+### Hybrid Architecture Design
+
+To accommodate GPU workloads, we implement a **two-path architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           HYBRID TEST ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│   ┌─────────────────────────────────┐    ┌─────────────────────────────────┐   │
+│   │   PATH A: NON-GPU TESTS         │    │   PATH B: GPU TESTS             │   │
+│   │   (Konflux ITS - Ephemeral)     │    │   (Dedicated Cluster)           │   │
+│   ├─────────────────────────────────┤    ├─────────────────────────────────┤   │
+│   │                                 │    │                                 │   │
+│   │  Cluster: EaaS HyperShift      │    │  Cluster: Persistent OCP       │   │
+│   │  Nodes: m5.xlarge / m6g.xlarge │    │  Nodes: g4dn.xlarge + g5.xlarge│   │
+│   │  GPU: ❌ None                   │    │  GPU: ✅ NVIDIA T4 / A10G       │   │
+│   │  Lifecycle: Ephemeral          │    │  Lifecycle: Always running     │   │
+│   │  Trigger: Component build      │    │  Trigger: Nightly / Manual     │   │
+│   │                                 │    │                                 │   │
+│   │  Test Selection:               │    │  Test Selection:               │   │
+│   │  -m "smoke and not gpu"        │    │  -m "gpu or model_server_gpu"  │   │
+│   │  -m "sanity and not gpu"       │    │  -m "llmd_gpu"                 │   │
+│   │                                 │    │                                 │   │
+│   └─────────────────────────────────┘    └─────────────────────────────────┘   │
+│                                                                                 │
+│   Coordination:                                                                 │
+│   • ITS (Path A) runs automatically on every component build                   │
+│   • GPU tests (Path B) run nightly or after ITS passes                         │
+│   • Both paths use same SNAPSHOT for component image validation                │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Path A: Non-GPU Tests (ITS Pipeline)
+
+| Aspect | Configuration |
+|--------|---------------|
+| **Pipeline** | `.tekton/integration-test-pipeline.yaml` |
+| **ITS CR** | `konflux/integration-test-scenario-smoke.yaml` |
+| **Cluster** | Ephemeral HyperShift via EaaS |
+| **Instance Type** | `m5.xlarge` (4 vCPU, 16 GB RAM) |
+| **Test Markers** | `-m "smoke and not gpu"` |
+| **Trigger** | Automatic on component build |
+| **Duration** | <45 minutes |
+
+### Path B: GPU Tests (Dedicated Cluster)
+
+| Aspect | Configuration |
+|--------|---------------|
+| **Pipeline** | `.github/workflows/gpu-tests.yaml` or separate Tekton pipeline |
+| **Cluster** | Persistent OpenShift with GPU nodes |
+| **Instance Type** | `g4dn.xlarge` (1x NVIDIA T4, 16GB VRAM) |
+| **GPU Operator** | NVIDIA GPU Operator + Node Feature Discovery |
+| **Test Markers** | `-m "gpu or model_server_gpu or llmd_gpu"` |
+| **Trigger** | Scheduled (nightly) or manual after ITS passes |
+| **Duration** | Variable (depends on test suite) |
+
+### Dedicated GPU Cluster Specification
+
+```yaml
+# Infrastructure requirements for Path B dedicated GPU cluster
+cluster:
+  provider: AWS
+  openshift_version: "4.16+"
+
+node_pools:
+  # Control plane (managed by OCP)
+  control_plane:
+    instance_type: m5.xlarge
+    count: 3
+
+  # Worker nodes for non-GPU workloads
+  workers:
+    instance_type: m5.2xlarge
+    count: 3
+
+  # GPU node pool for ML workloads
+  gpu_workers:
+    instance_type: g4dn.xlarge  # 1x NVIDIA T4, 16GB VRAM
+    count: 2-4
+    labels:
+      nvidia.com/gpu.present: "true"
+    taints:
+      - key: nvidia.com/gpu
+        value: "true"
+        effect: NoSchedule
+
+required_operators:
+  - name: Node Feature Discovery
+    namespace: openshift-nfd
+  - name: NVIDIA GPU Operator
+    namespace: nvidia-gpu-operator
+  - name: Open Data Hub Operator
+    namespace: openshift-operators
+
+estimated_cost:
+  g4dn.xlarge: $0.526/hour per node
+  monthly_2_nodes: ~$760/month (24x7)
+```
+
+### Test Marker Strategy
+
+Update `pytest.ini` markers and ensure tests are properly tagged:
+
+```python
+# tests/model_serving/gpu/test_vllm.py
+@pytest.mark.gpu           # Excludes from ITS
+@pytest.mark.model_server_gpu
+@pytest.mark.tier1
+def test_vllm_llama_inference():
+    """Test vLLM inference with Llama model on GPU."""
+    ...
+
+# tests/model_serving/cpu/test_sklearn.py
+@pytest.mark.smoke         # Included in ITS
+def test_sklearn_model_serving():
+    """Test sklearn model serving on CPU."""
+    ...
+```
+
+### Pipeline Test Selection
+
+**ITS Pipeline** (Path A):
+```bash
+uv run pytest -m "smoke and not gpu" tests/
+```
+
+**GPU Pipeline** (Path B):
+```bash
+uv run pytest -m "gpu or model_server_gpu or llmd_gpu" tests/
+```
+
 ## Implementation Phases
 
 ### Phase 0: Pipeline Skeleton
@@ -193,13 +350,13 @@ spec:
 - `scripts/install-odh.sh` - ODH installation script
 - Updated pipeline with install-odh task
 
-### Phase 2: Test Execution
+### Phase 2: Test Execution (Path A - Non-GPU)
 
-**Goal**: Run pytest smoke tests and collect results
+**Goal**: Run pytest smoke tests (excluding GPU) and collect results
 
 **Tasks**:
 1. Add run-tests task using opendatahub-tests container image
-2. Configure pytest with `-m smoke` marker
+2. Configure pytest with `-m "smoke and not gpu"` marker (exclude GPU tests)
 3. Generate JUnit XML report
 4. Upload test artifacts to Konflux storage
 5. Set pipeline result based on test outcome
@@ -238,6 +395,40 @@ spec:
 - `docs/KONFLUX_ITS.md` - User documentation
 - `konflux/integration-test-scenario-sanity.yaml` - Sanity ITS CR
 - Validated end-to-end flow
+
+### Phase 5: GPU Test Integration (Path B - Dedicated Cluster)
+
+**Goal**: Enable GPU tests on dedicated persistent cluster
+
+**Tasks**:
+1. Document dedicated GPU cluster requirements in `infra/gpu-cluster/README.md`
+2. Create GPU node pool configuration template
+3. Create `.github/workflows/gpu-tests.yaml` for GPU test execution
+4. Implement SNAPSHOT parameter passing to GPU pipeline
+5. Configure nightly trigger and manual dispatch
+6. Set up result reporting back to Konflux (optional webhook/API)
+
+**Deliverables**:
+- `infra/gpu-cluster/README.md` - GPU cluster setup guide
+- `infra/gpu-cluster/node-pool-config.yaml` - GPU node configuration
+- `.github/workflows/gpu-tests.yaml` - GPU test GitHub Action
+- Documentation for hybrid architecture operation
+
+**Prerequisites**:
+- Dedicated OpenShift cluster with GPU nodes provisioned
+- NVIDIA GPU Operator installed
+- Node Feature Discovery installed
+- ServiceAccount credentials for test execution
+
+**GPU Cluster Setup Checklist**:
+- [ ] AWS account with GPU instance quota (g4dn.xlarge or g5.xlarge)
+- [ ] OpenShift 4.14+ cluster deployed
+- [ ] GPU node pool with 2-4 g4dn.xlarge nodes
+- [ ] Node Feature Discovery Operator installed
+- [ ] NVIDIA GPU Operator installed and configured
+- [ ] ODH/RHOAI operator installed
+- [ ] ServiceAccount with appropriate RBAC for tests
+- [ ] Kubeconfig secret accessible to GitHub Actions
 
 ## Technical Design
 
@@ -703,10 +894,34 @@ if __name__ == "__main__":
 5. **SNAPSHOT image mapping**: How to map SNAPSHOT components to DSC fields?
    - **Proposed**: Start with dashboard; expand mapping as needed
 
+6. **GPU cluster provisioning**: Who provisions and maintains the dedicated GPU cluster?
+   - **Action**: Confirm infrastructure ownership (QE team, Platform team, or shared)
+   - **Cost consideration**: ~$760/month for 2x g4dn.xlarge nodes running 24x7
+
+7. **GPU cluster access**: How will GitHub Actions authenticate to the dedicated GPU cluster?
+   - **Proposed**: ServiceAccount token stored as GitHub secret
+   - **Alternative**: Use Konflux secrets if GPU pipeline runs as separate ITS
+
+8. **GPU test frequency**: How often should GPU tests run?
+   - **Proposed**: Nightly (to control costs) with manual trigger option
+   - **Alternative**: On-demand after non-GPU ITS passes
+
+9. **Konflux GPU support roadmap**: Will Konflux EaaS add GPU instance support in the future?
+   - **Action**: Check with Konflux team; may enable unified architecture later
+   - **Fallback**: Hybrid architecture remains viable long-term solution
+
 ## References
 
+### Konflux & ITS
 - [Konflux Integration Service](https://github.com/konflux-ci/integration-service)
 - [Konflux Pipeline Samples](https://github.com/konflux-ci/pipeline-samples)
 - [Konflux Build Definitions](https://github.com/konflux-ci/build-definitions)
 - [Ephemeral Clusters in Konflux](https://developers.redhat.com/articles/2024/10/28/ephemeral-openshift-clusters-konflux-ci-using-cluster-service-operator)
 - [IntegrationTestScenario CRD](https://github.com/konflux-ci/integration-service/blob/main/config/crd/bases/appstudio.redhat.com_integrationtestscenarios.yaml)
+- [EaaS StepAction - Supported Instance Types](https://github.com/konflux-ci/build-definitions/tree/main/stepactions/eaas-create-ephemeral-cluster-hypershift-aws)
+
+### GPU Infrastructure
+- [AWS EC2 G4 Instances (NVIDIA T4)](https://aws.amazon.com/ec2/instance-types/g4/)
+- [AWS EC2 G5 Instances (NVIDIA A10G)](https://aws.amazon.com/ec2/instance-types/g5/)
+- [NVIDIA GPU Operator Documentation](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html)
+- [OpenShift Node Feature Discovery](https://docs.openshift.com/container-platform/latest/hardware_enablement/psap-node-feature-discovery-operator.html)
